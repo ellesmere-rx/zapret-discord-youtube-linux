@@ -37,7 +37,6 @@ IPSET_ANY=false
 IPSET_DID_SWITCH=false
 QUICK_MODE=false
 NO_PING=false
-ESSENTIAL_ONLY=false
 SELECTED_STRATEGIES=()
 
 declare -a STRATEGIES=()
@@ -50,6 +49,9 @@ declare -A ANALYTICS_ERR=()
 declare -A ANALYTICS_UNSUP=()
 declare -A ANALYTICS_PING_OK=()
 declare -A ANALYTICS_PING_FAIL=()
+declare -A EXCLUDE_DOMAINS=()
+
+START_STRATEGY_LOG=""
 
 usage() {
     cat <<'EOF'
@@ -107,27 +109,8 @@ init_zapret_libs() {
     source "$SCRIPT_DIR/src/lib/common.sh"
     # shellcheck source=src/lib/firewall.sh
     source "$SCRIPT_DIR/src/lib/firewall.sh"
-
-    # Тихий nfqws
-    start_nfqws() {
-        stop_nfqws
-        cd "$REPO_DIR" || handle_error "Не удалось перейти в директорию $REPO_DIR"
-
-        local full_params=(
-            "$NFQWS_PATH"
-            --daemon
-            --debug=0
-            --dpi-desync-fwmark="$NFT_MARK"
-            --qnum="$NFT_QUEUE_NUM"
-        )
-
-        for params in "${nfqws_params[@]}"; do
-            full_params+=($params)
-        done
-
-        elevate "${full_params[@]}" >/dev/null 2>&1 ||
-            handle_error "Ошибка при запуске nfqws"
-    }
+    # shellcheck source=src/lib/test_nfqws_quiet.sh
+    source "$SCRIPT_DIR/src/lib/test_nfqws_quiet.sh"
 }
 
 stop_zapret() {
@@ -148,7 +131,6 @@ apply_fast_mode() {
 reset_test_settings() {
     QUICK_MODE=false
     NO_PING=false
-    ESSENTIAL_ONLY=true
     USE_FROM_LISTS=false
     LIST_SOURCES=()
     IPSET_ANY=false
@@ -177,24 +159,21 @@ start_strategy() {
     gamefiltertcp="false"
     gamefilterudp="false"
 
+    rm -f "$START_STRATEGY_LOG" 2>/dev/null || true
+    START_STRATEGY_LOG="$(mktemp)"
+
     log_info "[$name] Запуск стратегии..."
-    if ( run_zapret ) >/dev/null 2>&1; then
+    if ( run_zapret ) >"$START_STRATEGY_LOG" 2>&1; then
         return 0
     fi
     return 1
 }
 
 wait_for_nfqws() {
-    local name="$1"
-    local elapsed=0
-    while (( elapsed < NFQWS_START_TIMEOUT )); do
-        if pgrep -f nfqws >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    return 1
+    local _name="$1"
+    timeout "${NFQWS_START_TIMEOUT}s" tail -n +1 -f "$START_STRATEGY_LOG" 2>/dev/null | \
+        grep -qE "Настройка успешно завершена|Ошибка|error|failed" || true
+    pgrep -f nfqws >/dev/null 2>&1
 }
 
 # targets
@@ -230,6 +209,34 @@ load_targets_file() {
     return 0
 }
 
+load_essential_targets_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*\"(.+)\"[[:space:]]*$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+            local key_lc val_lc
+            key_lc="$(echo "$key" | tr '[:upper:]' '[:lower:]')"
+            val_lc="$(echo "$val" | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "$key_lc" =~ discord|youtube|youtu|google ]] &&
+               [[ ! "$val_lc" =~ discord|youtube|youtu\.be|google|googlevideo|gstatic ]]; then
+                continue
+            fi
+            if [[ "$val" =~ ^[Pp][Ii][Nn][Gg]:[[:space:]]*(.+)$ ]]; then
+                add_target "$key" "" "${BASH_REMATCH[1]}"
+            else
+                add_target "$key" "$val" ""
+            fi
+        fi
+    done < "$file"
+    return 0
+}
+
 load_default_targets() {
     add_target "DiscordMain" "https://discord.com" ""
     add_target "DiscordGateway" "https://gateway.discord.gg" ""
@@ -250,11 +257,34 @@ load_default_targets() {
     add_target "Quad9DNS9999" "" "9.9.9.9"
 }
 
+load_default_essential_targets() {
+    add_target "DiscordMain" "https://discord.com" ""
+    add_target "DiscordGateway" "https://gateway.discord.gg" ""
+    add_target "DiscordCDN" "https://cdn.discordapp.com" ""
+    add_target "YouTubeWeb" "https://www.youtube.com" ""
+    add_target "YouTubeShort" "https://youtu.be" ""
+    add_target "YouTubeVideoRedirect" "https://redirector.googlevideo.com" ""
+    add_target "GoogleMain" "https://www.google.com" ""
+    add_target "GoogleGstatic" "https://www.gstatic.com" ""
+}
+
+load_exclude_domains() {
+    local f="$LISTS_DIR/list-exclude.txt"
+    local line
+    EXCLUDE_DOMAINS=()
+    [[ -f "$f" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -z "$line" ]] && continue
+        EXCLUDE_DOMAINS["$line"]=1
+    done < "$f"
+}
+
 domain_in_exclude() {
     local domain="$1"
-    local f="$LISTS_DIR/list-exclude.txt"
-    [[ -f "$f" ]] || return 1
-    grep -Fxq "$domain" "$f" 2>/dev/null
+    [[ -n "${EXCLUDE_DOMAINS[$domain]:-}" ]]
 }
 
 load_domains_from_list() {
@@ -283,6 +313,8 @@ load_from_lists() {
     else
         sources=("${LIST_SOURCES[@]}")
     fi
+
+    load_exclude_domains
 
     for src in "${sources[@]}"; do
         if [[ "$src" == "all" ]]; then
@@ -325,7 +357,7 @@ curl_probe() {
     local url="$1"
     local label="$2"
     local -a extra=()
-    local stderr_file out code
+    local out code
 
     case "$label" in
         HTTP)   extra=(--http1.1) ;;
@@ -334,20 +366,16 @@ curl_probe() {
         *) return 1 ;;
     esac
 
-    stderr_file="$(mktemp)"
     out="$(curl -I -s --connect-timeout "$CURL_CONNECT_TIMEOUT" -m "$CURL_TIMEOUT" \
         -o /dev/null -w '%{http_code}' \
-        "${extra[@]}" --show-error "$url" 2>"$stderr_file")"
+        "${extra[@]}" --show-error "$url" 2>&1)"
     code=$?
-    local err
-    err="$(cat "$stderr_file")"
-    rm -f "$stderr_file"
 
-    if echo "$err" | grep -qiE 'could not resolve host|certificate|SSL certificate|self[- ]?signed|unable to get local issuer'; then
+    if echo "$out" | grep -qiE 'could not resolve host|certificate|SSL certificate|self[- ]?signed|unable to get local issuer'; then
         echo "SSL"
         return 0
     fi
-    if [[ $code -eq 35 ]] || echo "$err" | grep -qiE 'not supported|unsupported protocol|Unrecognized option|Unknown option'; then
+    if [[ $code -eq 35 ]] || echo "$out" | grep -qiE 'not supported|unsupported protocol|Unrecognized option|Unknown option'; then
         echo "UNSUP"
         return 0
     fi
@@ -406,24 +434,6 @@ probe_target() {
 
     LAST_PROBE_TOKENS="${tokens[*]}"
     LAST_PROBE_PING="$ping_res"
-}
-
-filter_essential_targets() {
-    local -a n=() u=() p=()
-    local i name url
-    for i in "${!TARGET_NAMES[@]}"; do
-        name="${TARGET_NAMES[$i]}"
-        url="${TARGET_URLS[$i]}"
-        if [[ "$name" =~ [Dd]iscord|[Yy]ou[Tt]ube|[Gg]oogle|[Yy]outu ]] ||
-           [[ "$url" =~ discord|youtube|youtu\.be|google|googlevideo|gstatic ]]; then
-            n+=("$name")
-            u+=("${TARGET_URLS[$i]}")
-            p+=("${TARGET_PING[$i]}")
-        fi
-    done
-    TARGET_NAMES=("${n[@]}")
-    TARGET_URLS=("${u[@]}")
-    TARGET_PING=("${p[@]}")
 }
 
 show_target_result() {
@@ -494,7 +504,7 @@ show_target_line() {
 run_targets_for_strategy() {
     local strategy="$1"
     local idx tmpdir
-    local -a pids=()
+    local running=0
 
     if (( PARALLEL_JOBS <= 1 )); then
         for idx in "${!TARGET_NAMES[@]}"; do
@@ -511,13 +521,16 @@ run_targets_for_strategy() {
             printf '%s\n' "$LAST_PROBE_TOKENS" > "$tmpdir/$idx.tokens"
             printf '%s\n' "$LAST_PROBE_PING" > "$tmpdir/$idx.ping"
         ) &
-        pids+=($!)
-        if ((${#pids[@]} >= PARALLEL_JOBS)); then
-            wait "${pids[0]}" 2>/dev/null || true
-            pids=("${pids[@]:1}")
+        ((running++))
+        if (( running >= PARALLEL_JOBS )); then
+            wait -n 2>/dev/null || true
+            ((running--))
         fi
     done
-    wait 2>/dev/null || true
+    while (( running > 0 )); do
+        wait -n 2>/dev/null || true
+        ((running--))
+    done
 
     for idx in "${!TARGET_NAMES[@]}"; do
         local tokens ping_res
@@ -636,12 +649,14 @@ run_tests_for_strategy() {
     run_targets_for_strategy "$strategy"
 
     stop_zapret
+    rm -f "$START_STRATEGY_LOG" 2>/dev/null || true
+    START_STRATEGY_LOG=""
     return 0
 }
 
 print_analytics() {
     local best="" best_score=-1 best_ping=-1 s score ping_score
-    local a_ok a_err a_pok a_pf line_color
+    local a_ok a_err a_unsup a_pok a_pf line_color
 
     echo ""
     echo -e "${BOLD}=== ANALYTICS ===${NC}"
@@ -649,9 +664,11 @@ print_analytics() {
     for s in "${STRATEGIES[@]}"; do
         a_ok=${ANALYTICS_OK[$s]:-0}
         a_err=${ANALYTICS_ERR[$s]:-0}
+        a_unsup=${ANALYTICS_UNSUP[$s]:-0}
         a_pok=${ANALYTICS_PING_OK[$s]:-0}
         a_pf=${ANALYTICS_PING_FAIL[$s]:-0}
-        local line="$s : HTTP OK: $a_ok, ERR: $a_err, Ping OK: $a_pok, Fail: $a_pf"
+        score=$((a_ok * 3 + a_unsup - a_err * 4 + a_pok - a_pf * 2))
+        local line="$s : HTTP OK: $a_ok, ERR: $a_err, UNSUP: $a_unsup, Ping OK: $a_pok, Fail: $a_pf, Score: $score"
         if [[ "$a_err" -eq 0 ]]; then
             line_color="$GREEN"
         else
@@ -659,7 +676,6 @@ print_analytics() {
         fi
         echo -e "${line_color}$line${NC}"
 
-        score=$a_ok
         ping_score=$a_pok
         if [[ $score -gt $best_score ]] || { [[ $score -eq $best_score ]] && [[ $ping_score -gt $best_ping ]]; }; then
             best_score=$score
@@ -669,7 +685,7 @@ print_analytics() {
     done
 
     echo ""
-    echo -e "${GREEN}Best strategy: ${best:-none}${NC}"
+    echo -e "${GREEN}Best strategy: ${best:-none}${NC} ${DIM}(по взвешенному score)${NC}"
 }
 
 # интерактивная настройка
@@ -781,11 +797,11 @@ menu_configure_test() {
                 ;;
             2)
                 if [[ "$TARGETS_MODE" == "default" ]]; then
-                    TARGETS_MODE="essential"; ESSENTIAL_ONLY=true; USE_FROM_LISTS=false
+                    TARGETS_MODE="essential"; USE_FROM_LISTS=false
                 elif [[ "$TARGETS_MODE" == "essential" ]]; then
-                    TARGETS_MODE="lists"; ESSENTIAL_ONLY=false; USE_FROM_LISTS=true; LIST_SOURCES=(general google)
+                    TARGETS_MODE="lists"; USE_FROM_LISTS=true; LIST_SOURCES=(general google)
                 else
-                    TARGETS_MODE="default"; ESSENTIAL_ONLY=false; USE_FROM_LISTS=false
+                    TARGETS_MODE="default"; USE_FROM_LISTS=false
                 fi
                 CUSTOM_TARGETS_FILE=""
                 ;;
@@ -841,7 +857,7 @@ parse_test_cli_args() {
         --fast) apply_fast_mode; shift ;;
         --quick) QUICK_MODE=true; shift ;;
         --no-ping) NO_PING=true; shift ;;
-        --essential) ESSENTIAL_ONLY=true; TARGETS_MODE="essential"; shift ;;
+        --essential) TARGETS_MODE="essential"; shift ;;
         -j|--jobs)
             shift
             PARALLEL_JOBS="${1:?}"
@@ -909,6 +925,13 @@ TARGET_PING=()
 
 if [[ "$TARGETS_MODE" == "custom" && -n "$CUSTOM_TARGETS_FILE" ]]; then
     load_targets_file "$CUSTOM_TARGETS_FILE" || log_warn "Не удалось прочитать $CUSTOM_TARGETS_FILE"
+elif [[ "$TARGETS_MODE" == "essential" ]]; then
+    if load_essential_targets_file "$TARGETS_FILE"; then
+        log_info "Основные цели из $TARGETS_FILE"
+    else
+        log_warn "targets.txt не найден, встроенные основные цели"
+        load_default_essential_targets
+    fi
 elif load_targets_file "$TARGETS_FILE"; then
     log_info "Цели из $TARGETS_FILE"
 else
@@ -919,9 +942,6 @@ fi
 $USE_FROM_LISTS && load_from_lists
 
 dedupe_targets
-if $ESSENTIAL_ONLY || [[ "$TARGETS_MODE" == "essential" ]]; then
-    filter_essential_targets
-fi
 compute_max_name_len
 
 if [[ ${#TARGET_NAMES[@]} -eq 0 ]]; then
